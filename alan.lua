@@ -435,18 +435,37 @@ local function put(x, y, l)
 end
 
 local function wline(x0, y0, x1, y1, l)
+  -- entera fuera de la pantalla: no se recorre
+  if (x0 < -1 and x1 < -1) or (x0 > 129 and x1 > 129) or (y0 < -1 and y1 < -1) or (y0 > 65 and y1 > 65) then
+    return
+  end
   local dx, dy = x1 - x0, y1 - y0
   local n = floor(max(abs(dx), abs(dy)) + 0.5)
   if n < 1 then n = 1 end
   dx, dy = dx / n, dy / n
   x0, y0 = x0 + 0.5, y0 + 0.5
-  for _ = 0, n do
-    local x, y = floor(x0), floor(y0)
+  local ka, kb = 0, n
+  if n > 48 then
+    -- linea larga (camara muy cerca): solo el tramo que cae en pantalla
+    if dx > 0 then
+      ka, kb = max(ka, -x0 / dx), min(kb, (128 - x0) / dx)
+    elseif dx < 0 then
+      ka, kb = max(ka, (128 - x0) / dx), min(kb, -x0 / dx)
+    end
+    if dy > 0 then
+      ka, kb = max(ka, -y0 / dy), min(kb, (64 - y0) / dy)
+    elseif dy < 0 then
+      ka, kb = max(ka, (64 - y0) / dy), min(kb, -y0 / dy)
+    end
+    if ka > kb then return end
+    ka, kb = floor(ka), min(n, floor(kb) + 1)
+  end
+  for k = ka, kb do
+    local x, y = floor(x0 + dx * k), floor(y0 + dy * k)
     if x >= 0 and x < 128 and y >= 0 and y < 64 then
       local i = y * 128 + x + 1
       if fb[i] < l then fb[i] = l end
     end
-    x0, y0 = x0 + dx, y0 + dy
   end
 end
 
@@ -540,7 +559,24 @@ end
 -- piso: charco de dither bajo los pies (Bayer 4x4 en pantalla, se apaga hacia afuera)
 local BAY = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}
 local FLR = 1.5      -- radio del charco (m)
+-- el charco se guarda: con la camara quieta se reusa; en movimiento se recalcula
+-- cuadro por medio
+local FLC = {n = 0, I = {}, L = {}, key = {}, age = 99}
 local function floor_dither()
+  local key, CI, CL = FLC.key, FLC.I, FLC.L
+  local same = key[1] == S.cy and key[2] == S.cp and key[3] == S.cd
+    and key[4] == TGT[1] and key[5] == TGT[2] and key[6] == TGT[3]
+  FLC.age = FLC.age + 1
+  if same or FLC.age < 2 then
+    for j = 1, FLC.n do
+      local i = CI[j]
+      if fb[i] < CL[j] then fb[i] = CL[j] end
+    end
+    return
+  end
+  key[1], key[2], key[3], key[4], key[5], key[6] = S.cy, S.cp, S.cd, TGT[1], TGT[2], TGT[3]
+  FLC.age = 0
+  local cn = 0
   local camd = S.cdist
   local v1, v2, v3, v4, v5, v6, v7, v8, v9 = V[1], V[2], V[3], V[4], V[5], V[6], V[7], V[8], V[9]
   local FY = -0.035
@@ -563,24 +599,31 @@ local function floor_dither()
     local row = sy * W + 1
     local brow = (sy % 4) * 4 + 1
     for sx = x0, x1 do
-      local u = (sx + 0.5 - SCX) / F
-      local a = v2 * u + v5 * v - v8
-      if a < -1e-4 or a > 1e-4 then
-        local t = (FY - b) / a
-        if t > 0.2 then
-          local qx, qy, qz = t * u, t * v, camd - t
-          local wx = TGT[1] + v1 * qx + v4 * qy + v7 * qz
-          local wz = TGT[3] + v3 * qx + v6 * qy + v9 * qz
-          local L = 1 - sqrt(wx * wx + wz * wz) / FLR
-          if L > 0 and L * L * 7 > BAY[brow + sx % 4] then
-            local i = row + sx
-            local lv = (L > 0.5) and 3 or 2
-            if fb[i] < lv then fb[i] = lv end
+      -- solo las celdas de la trama que pueden llegar a prenderse (L * L * 7 < 7)
+      local bt = BAY[brow + sx % 4]
+      if bt < 7 then
+        local u = (sx + 0.5 - SCX) / F
+        local a = v2 * u + v5 * v - v8
+        if a < -1e-4 or a > 1e-4 then
+          local t = (FY - b) / a
+          if t > 0.2 then
+            local qx, qy, qz = t * u, t * v, camd - t
+            local wx = TGT[1] + v1 * qx + v4 * qy + v7 * qz
+            local wz = TGT[3] + v3 * qx + v6 * qy + v9 * qz
+            local L = 1 - sqrt(wx * wx + wz * wz) / FLR
+            if L > 0 and L * L * 7 > bt then
+              local i = row + sx
+              local lv = (L > 0.5) and 3 or 2
+              cn = cn + 1
+              CI[cn], CL[cn] = i, lv
+              if fb[i] < lv then fb[i] = lv end
+            end
           end
         end
       end
     end
   end
+  FLC.n = cn
 end
 
 local BB = {0, W - 2, 0, H - 2}  -- caja ocupada en el cuadro anterior
@@ -615,9 +658,12 @@ local function compose()
   local tb = floor(t * 2.1 / TAU * 256)
   -- las particulas del cuerpo: tenues dentro de la malla, plenas al desintegrar
   local pvis = 0.3 + 0.7 * min(1, dis * 2.5)
-  -- en reposo alcanza con la mitad de los puntos (con el doble de peso)
-  local pstep = 1
-  if dis < 0.01 then pstep = 2; pvis = pvis * 2 end
+  -- alcanza con la mitad de los puntos (con el doble de peso)
+  local pstep = 2
+  pvis = pvis * 2
+  -- de lejos el cuerpo se vuelve traslucido: se apaga la malla, queda el contorno
+  local far = clamp((camd - 2.8) / 1.7, 0, 1)
+  local farb = far * 8
   local tb2 = floor(t * 0.6 / TAU * 256)
 
   for s = 1, NSEG do
@@ -701,6 +747,16 @@ local function compose()
           local s = (v - 4) / 6
           v = v * (1 - (s > 1 and 1 or s) * 0.6)
         end
+        if far > 0 and d > 0.5 then
+          local i = row + x
+          if (D[i - 1] or 0) < 0.5 or (D[i + 1] or 0) < 0.5 or (D[i - W] or 0) < 0.5 or (D[i + W] or 0) < 0.5 then
+            -- borde de la silueta: marcado
+            if v < 13 then v = v + (13 - v) * far end
+          elseif BAY[(y % 4) * 4 + x % 4 + 1] < farb then
+            -- interior: trama de puntos apagados (sin grises bajos)
+            v = 0
+          end
+        end
       end
       fb[row + x] = floor(v + 0.5)
     end
@@ -708,7 +764,7 @@ local function compose()
 
   -- malla de alambre: lo que mira a la camara brilla, lo de atras queda tenue;
   -- al desintegrar se apaga y quedan solo las particulas
-  local wa = 1 - min(1, dis * 2.2)
+  local wa = (1 - min(1, dis * 2.2)) * (1 - far)
   if wa > 0.02 then
     local WS, WSEG, WPX, WPY, WPZ = WA.S, WA.SEG, WA.PX, WA.PY, WA.PZ
     local WNX, WNY, WNZ, EA, EB = WA.NX, WA.NY, WA.NZ, WA.EA, WA.EB
@@ -928,6 +984,9 @@ local function emit(n, segs, speed)
     else
       i = random(NP)
     end
+    -- se dibuja un punto de cada dos: se toma el que si tiene posicion en pantalla
+    local s0 = SEG0[PS[i]]
+    i = s0 + 2 * floor((i - s0) / 2)
     local x, y = SX[i], SY[i]
     if x then
       local dx, dy = x - cx, y - cy
@@ -1334,7 +1393,15 @@ function init()
 
   S.metro = metro.init(function()
     step(DT)
-    redraw()
+    -- freno: si el cuadro anterior tardo demasiado, este no se dibuja
+    -- (el sonido y los controles siguen), asi no se encolan los encoders
+    if S.skip then
+      S.skip = false
+    else
+      local t0 = util.time()
+      redraw()
+      if util.time() - t0 > 0.045 then S.skip = true end
+    end
   end, DT, -1)
   S.metro:start()
 end
